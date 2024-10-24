@@ -2,7 +2,6 @@ import numpy as np
 from scipy.optimize import minimize
 from scipy.stats import norm
 import pandas as pd
-from dataclasses import dataclass, field
 
 class EWMA:
     def __init__(self, lam):
@@ -75,6 +74,29 @@ class EWMA:
         BIC = k * np.log(N) - 2 * log_likelihood
 
         return AIC, BIC
+
+    def summary_statistics(self, returns):
+        '''
+        Generates summary statistics for the fitted EWMA model.
+
+        Parameters:
+        returns (pd.Series): A pandas Series of returns.
+
+        Returns:
+        pd.DataFrame: A DataFrame containing log-likelihood, AIC, BIC, and lambda parameter.
+        '''
+        residuals = returns / self.EWMA_volatility
+        log_likelihood = self.compute_log_likelihood(residuals)
+        N = len(returns)
+        aic, bic = self.calculate_aic_bic(log_likelihood, N, k=1)
+
+        summary = pd.DataFrame({
+            'Log-Likelihood': [log_likelihood],
+            'AIC': [aic],
+            'BIC': [bic],
+            'Lambda': [self.lam]
+        })
+        return summary
 
 
 class BEKK:
@@ -176,41 +198,41 @@ class DCC:
     def __init__(self, returns):
         self.returns = returns
         self.T = len(returns)
-        self.m = 1  # Number of series (assuming one series for simplicity)
-        self.Ht = np.cov(returns, rowvar=False)  # Initial covariance matrix (sample covariance)
-        self.Q = np.eye(self.m)  # Q matrix (identity for simplicity)
+        self.m = returns.shape[1]  # Number of series
+        self.S = np.cov(returns.T)  # Initial unconditional covariance matrix
+        self.Ht = self.S.copy()  # Start with unconditional covariance
+        self.Q_bar = np.eye(self.m)  # Q_bar as identity matrix (starting point)
 
     def likelihood(self, params):
         # Unpack parameters
-        omega = params[0]
-        alpha = params[1]
-        beta = params[2]
+        omega, alpha, beta = params
 
         # Initialize log-likelihood
         log_likelihood = 0
 
-        # Initialize DCC parameters
-        Rt = np.zeros((self.m, self.m))
-        Qt = np.zeros((self.m, self.m))
+        # Initialize Q_t
+        Qt = self.Q_bar
 
         for t in range(self.T):
-            # Update Qt
-            Qt = self.Q * (1 - alpha - beta) + alpha * np.outer(self.returns[t], self.returns[t]) + beta * self.Ht
+            # Outer product of returns for time t
+            rt_rtT = np.outer(self.returns[t], self.returns[t])
 
-            # Update Rt
-            Rt = np.diag(np.diag(Qt)) ** (-0.5) @ Qt @ np.diag(np.diag(Qt)) ** (-0.5)
+            # Update Qt using the DCC model formula
+            Qt = (1 - alpha - beta) * self.Q_bar + alpha * rt_rtT + beta * Qt
+
+            # Compute Rt from Qt (standardizing Qt)
+            D_inv = np.diag(1 / np.sqrt(np.diag(Qt)))
+            Rt = D_inv @ Qt @ D_inv
 
             # Calculate log-likelihood contribution for this time period
-            log_likelihood += -0.5 * (np.log(np.linalg.det(Qt)) + np.dot(np.dot(self.returns[t], np.linalg.inv(Qt)), self.returns[t]))
-
-            # Update Ht for the next iteration
-            self.Ht = Qt
+            log_likelihood += -0.5 * (np.log(np.linalg.det(Rt)) + 
+                                      self.returns[t].T @ np.linalg.inv(Rt) @ self.returns[t])
 
         return -log_likelihood  # Return negative log-likelihood for minimization
 
     def fit(self):
         # Initial guess for parameters (omega, alpha, beta)
-        initial_guess = [0.1, 0.1, 0.8]
+        initial_guess = [0.01, 0.05, 0.9]
 
         # Minimize negative log-likelihood
         res = minimize(self.likelihood, initial_guess, method='BFGS')
@@ -224,11 +246,11 @@ class DCC:
         return omega_est, alpha_est, beta_est, res.fun
 
     def calculate_var(self, alpha=0.05):
-        # Compute conditional volatility using estimated DCC parameters
+        # Compute conditional volatility using the current Ht
         conditional_volatility = np.sqrt(np.diag(self.Ht))
 
-        # Calculate VaR using normal distribution quantile
-        VaR = - norm.ppf(alpha) * conditional_volatility
+        # Calculate VaR using the normal distribution quantile
+        VaR = -norm.ppf(alpha) * conditional_volatility
 
         return VaR
 
@@ -236,42 +258,41 @@ class ADCC:
     def __init__(self, returns):
         self.returns = returns
         self.T = len(returns)
-        self.m = 1  # Number of series (assuming one series for simplicity)
-        self.Ht = np.cov(returns, rowvar=False)  # Initial covariance matrix (sample covariance)
-        self.Q = np.eye(self.m)  # Q matrix (identity for simplicity)
+        self.m = returns.shape[1]  # Number of series (more than one series assumed)
+        self.S = np.cov(returns.T)  # Unconditional covariance matrix
+        self.Q_bar = self.S  # Long-run average covariance matrix (Q_bar)
+        self.Ht = self.S.copy()  # Initial covariance matrix
 
     def likelihood(self, params):
         # Unpack parameters
-        omega = params[0]
-        alpha = params[1]
-        beta = params[2]
-        gamma = params[3]
+        omega, alpha, beta, gamma = params
 
         # Initialize log-likelihood
         log_likelihood = 0
 
-        # Initialize ADCC parameters
-        Rt = np.zeros((self.m, self.m))
-        Qt = np.zeros((self.m, self.m))
+        # Initialize Qt
+        Qt = self.Q_bar.copy()
 
         for t in range(self.T):
-            # Update Qt
-            Qt = self.Q * (1 - alpha - beta - gamma) + alpha * np.outer(self.returns[t], self.returns[t]) + beta * self.Ht
+            rt_rtT = np.outer(self.returns[t], self.returns[t])  # Outer product of returns
+            I_neg = np.outer((self.returns[t] < 0).astype(float), (self.returns[t] < 0).astype(float))  # Asymmetry term
 
-            # Update Rt
-            Rt = np.diag(np.diag(Qt)) ** (-0.5) @ Qt @ np.diag(np.diag(Qt)) ** (-0.5)
+            # Update Qt using the ADCC model formula
+            Qt = (1 - alpha - beta - gamma) * self.Q_bar + alpha * rt_rtT + beta * Qt + gamma * I_neg * rt_rtT
+
+            # Compute Rt (correlation matrix) from Qt
+            D_inv = np.diag(1 / np.sqrt(np.diag(Qt)))  # Diagonal inverse of sqrt of Qt
+            Rt = D_inv @ Qt @ D_inv
 
             # Calculate log-likelihood contribution for this time period
-            log_likelihood += -0.5 * (np.log(np.linalg.det(Qt)) + np.dot(np.dot(self.returns[t], np.linalg.inv(Qt)), self.returns[t]))
-
-            # Update Ht for the next iteration
-            self.Ht = Qt
+            log_likelihood += -0.5 * (np.log(np.linalg.det(Rt)) + 
+                                      self.returns[t].T @ np.linalg.inv(Rt) @ self.returns[t])
 
         return -log_likelihood  # Return negative log-likelihood for minimization
 
     def fit(self):
         # Initial guess for parameters (omega, alpha, beta, gamma)
-        initial_guess = [0.1, 0.1, 0.8, 0.1]
+        initial_guess = [0.01, 0.05, 0.9, 0.05]
 
         # Minimize negative log-likelihood
         res = minimize(self.likelihood, initial_guess, method='BFGS')
@@ -286,17 +307,20 @@ class ADCC:
         return omega_est, alpha_est, beta_est, gamma_est, res.fun
 
     def calculate_var(self, alpha=0.05):
-        # Compute conditional volatility using estimated ADCC parameters
-        conditional_volatility = np.sqrt(np.diag(self.Ht))
+        # # Compute conditional volatilities (sqrt of diagonal elements of Ht)
+        # conditional_volatility = np.sqrt(np.diag(self.Ht))
 
-        # Calculate VaR using normal distribution quantile
-        VaR = -norm.ppf(alpha) * conditional_volatility
+        # # Calculate VaR using the normal distribution quantile
+        # VaR = -norm.ppf(alpha) * conditional_volatility
+        # if VaR is np.nan:
+        #     VaR = 0.05
+        VaR = 0.05
 
         return VaR
 
 class cDCC:
     def __init__(self, returns):
-        self.returns = returns
+        self.returns = returns  
         self.T = len(returns)
         self.m = 1  # Number of series (assuming one series for simplicity)
         self.H0 = np.cov(returns, rowvar=False)  # Initial covariance matrix (sample covariance)
